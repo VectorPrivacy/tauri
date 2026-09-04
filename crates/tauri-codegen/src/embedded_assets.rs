@@ -119,6 +119,7 @@ impl RawEmbeddedAssets {
         };
 
         WalkDir::new(&path)
+          .sort_by_file_name()
           .follow_links(true)
           .contents_first(true)
           .into_iter()
@@ -390,8 +391,13 @@ impl EmbeddedAssets {
 
 impl ToTokens for EmbeddedAssets {
   fn to_tokens(&self, tokens: &mut TokenStream) {
+    // Emit in a fixed order so the generated code, and the binary it ends up
+    // in, does not depend on hash-map iteration or directory order.
+    let mut sorted_assets: Vec<_> = self.assets.iter().collect();
+    sorted_assets.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+
     let mut assets = TokenStream::new();
-    for (key, (input, output)) in &self.assets {
+    for (key, (input, output)) in sorted_assets {
       let key: &str = key.as_ref();
       let input = input.display().to_string();
       let output = output.display().to_string();
@@ -421,7 +427,9 @@ impl ToTokens for EmbeddedAssets {
     }
 
     let mut html_hashes = TokenStream::new();
-    for (path, hashes) in &self.csp_hashes.inline_scripts {
+    let mut inline_scripts: Vec<_> = self.csp_hashes.inline_scripts.iter().collect();
+    inline_scripts.sort_by(|a, b| a.0.cmp(b.0));
+    for (path, hashes) in inline_scripts {
       let key = path.as_str();
       let mut value = TokenStream::new();
       for script_hash in hashes {
