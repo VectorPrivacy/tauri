@@ -59,9 +59,9 @@ pub struct ResolvedCommand {
   #[cfg(debug_assertions)]
   pub referenced_by: ResolvedCommandReference,
   /// The list of window label patterns that was resolved for this command.
-  pub windows: Vec<glob::Pattern>,
+  pub windows: std::sync::Arc<[glob::Pattern]>,
   /// The list of webview label patterns that was resolved for this command.
-  pub webviews: Vec<glob::Pattern>,
+  pub webviews: std::sync::Arc<[glob::Pattern]>,
   /// The reference of the scope that is associated with this command. See [`Resolved#structfield.command_scopes`].
   pub scope_id: Option<ScopeKey>,
 }
@@ -73,8 +73,8 @@ impl ResolvedCommand {
   pub fn new(
     context: ExecutionContext,
     #[cfg_attr(not(debug_assertions), allow(unused))] referenced_by: ResolvedCommandReference,
-    windows: Vec<glob::Pattern>,
-    webviews: Vec<glob::Pattern>,
+    windows: std::sync::Arc<[glob::Pattern]>,
+    webviews: std::sync::Arc<[glob::Pattern]>,
     scope_id: Option<ScopeKey>,
   ) -> Self {
     Self {
@@ -258,7 +258,7 @@ impl Resolved {
   }
 }
 
-fn parse_glob_patterns(mut raw: Vec<String>) -> Result<Vec<glob::Pattern>, Error> {
+fn parse_glob_patterns(mut raw: Vec<String>) -> Result<std::sync::Arc<[glob::Pattern]>, Error> {
   raw.sort();
 
   let mut patterns = Vec::new();
@@ -266,7 +266,31 @@ fn parse_glob_patterns(mut raw: Vec<String>) -> Result<Vec<glob::Pattern>, Error
     patterns.push(glob::Pattern::new(&pattern)?);
   }
 
-  Ok(patterns)
+  Ok(patterns.into())
+}
+
+/// The parsed label patterns for `raw`, shared: every command a capability allows names the
+/// same window list, so each distinct list is parsed and allocated once, and cloning a
+/// resolved command (once per IPC call) copies a pointer.
+#[doc(hidden)]
+pub fn label_patterns(raw: &[&str]) -> std::sync::Arc<[glob::Pattern]> {
+  use std::sync::{Arc, Mutex, OnceLock};
+  type Interned = Vec<(Box<[Box<str>]>, Arc<[glob::Pattern]>)>;
+  static INTERNED: OnceLock<Mutex<Interned>> = OnceLock::new();
+  let mut interned = INTERNED.get_or_init(Default::default).lock().unwrap();
+  if let Some((_, patterns)) = interned
+    .iter()
+    .find(|(key, _)| key.len() == raw.len() && key.iter().zip(raw).all(|(a, b)| &**a == *b))
+  {
+    return patterns.clone();
+  }
+  let patterns: Arc<[glob::Pattern]> = raw
+    .iter()
+    .map(|p| glob::Pattern::new(p).expect("label pattern was validated at build time"))
+    .collect::<Vec<_>>()
+    .into();
+  interned.push((raw.iter().map(|s| Box::from(*s)).collect(), patterns.clone()));
+  patterns
 }
 
 fn resolve_command(
@@ -530,14 +554,10 @@ mod build {
 
       let context = &self.context;
 
-      let windows = vec_lit(&self.windows, |window| {
-        let w = window.as_str();
-        quote!(#w.parse().unwrap())
-      });
-      let webviews = vec_lit(&self.webviews, |window| {
-        let w = window.as_str();
-        quote!(#w.parse().unwrap())
-      });
+      let windows = self.windows.iter().map(|w| w.as_str());
+      let windows = quote!(::tauri::utils::acl::resolved::label_patterns(&[#(#windows),*]));
+      let webviews = self.webviews.iter().map(|w| w.as_str());
+      let webviews = quote!(::tauri::utils::acl::resolved::label_patterns(&[#(#webviews),*]));
       let scope_id = opt_lit(self.scope_id.as_ref());
 
       tokens.append_all(quote! {

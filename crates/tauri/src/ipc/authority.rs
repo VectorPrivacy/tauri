@@ -24,10 +24,54 @@ use crate::{Runtime, ipc::InvokeError, sealed::ManagerBase};
 
 use super::{CommandArg, CommandItem};
 
+/// The plugins' permission manifests, kept as the JSON codegen embedded and parsed on first use:
+/// only a capability added at runtime, or a denied command's error message, resolves against
+/// them, and building them at startup cost thousands of allocations for nothing.
+#[cfg(any(feature = "dynamic-acl", debug_assertions))]
+#[doc(hidden)]
+pub struct LazyAcl {
+  json: &'static str,
+  parsed: std::sync::OnceLock<BTreeMap<String, Manifest>>,
+}
+
+#[cfg(any(feature = "dynamic-acl", debug_assertions))]
+impl LazyAcl {
+  /// Manifests serialized by codegen, parsed when first needed.
+  pub const fn from_json(json: &'static str) -> Self {
+    Self {
+      json,
+      parsed: std::sync::OnceLock::new(),
+    }
+  }
+
+  fn get(&self) -> &BTreeMap<String, Manifest> {
+    self
+      .parsed
+      .get_or_init(|| serde_json::from_str(self.json).expect("embedded ACL manifests are valid JSON"))
+  }
+}
+
+#[cfg(any(feature = "dynamic-acl", debug_assertions))]
+impl Default for LazyAcl {
+  fn default() -> Self {
+    Self::from_json("{}")
+  }
+}
+
+#[cfg(any(feature = "dynamic-acl", debug_assertions))]
+impl From<BTreeMap<String, Manifest>> for LazyAcl {
+  fn from(acl: BTreeMap<String, Manifest>) -> Self {
+    Self {
+      json: "{}",
+      parsed: std::sync::OnceLock::from(acl),
+    }
+  }
+}
+
 /// The runtime authority used to authorize IPC execution based on the Access Control List.
 pub struct RuntimeAuthority {
   #[cfg(any(feature = "dynamic-acl", debug_assertions))]
-  acl: BTreeMap<String, Manifest>,
+  acl: LazyAcl,
   has_app_acl: bool,
   allowed_commands: BTreeMap<String, Vec<ResolvedCommand>>,
   denied_commands: BTreeMap<String, Vec<ResolvedCommand>>,
@@ -106,7 +150,7 @@ impl RuntimeAuthority {
   /// **Please prefer using the [`runtime_authority`] macro instead of calling this directly**
   #[doc(hidden)]
   pub fn new(
-    #[cfg(any(feature = "dynamic-acl", debug_assertions))] acl: BTreeMap<String, Manifest>,
+    #[cfg(any(feature = "dynamic-acl", debug_assertions))] acl: LazyAcl,
     resolved_acl: Resolved,
   ) -> Self {
     let command_cache = resolved_acl
@@ -139,7 +183,7 @@ impl RuntimeAuthority {
       command,
       vec![ResolvedCommand {
         context,
-        windows: vec!["*".parse().unwrap()],
+        windows: vec!["*".parse().unwrap()].into(),
         ..Default::default()
       }],
     );
@@ -172,7 +216,7 @@ impl RuntimeAuthority {
     }
 
     let resolved = Resolved::resolve_with_base_scope_id(
-      &self.acl,
+      self.acl.get(),
       capabilities,
       tauri_utils::platform::Target::current(),
       self.scope_manager.last_scope_id(),
@@ -364,8 +408,9 @@ impl RuntimeAuthority {
       } else {
         let permission_error_detail = if let Some((key, manifest)) = self
           .acl
+          .get()
           .get_key_value(key)
-          .or_else(|| self.acl.get_key_value(&format!("core:{key}")))
+          .or_else(|| self.acl.get().get_key_value(&format!("core:{key}")))
         {
           let mut permissions_referencing_command = Vec::new();
 
@@ -855,7 +900,7 @@ mod tests {
     let webview = "other-*";
 
     let resolved_cmd = vec![ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
       ..Default::default()
     }];
     let allowed_commands = [(command.to_string(), resolved_cmd.clone())]
@@ -888,8 +933,8 @@ mod tests {
     let webview = "main-*";
 
     let resolved_cmd = vec![ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
-      webviews: vec![Pattern::new(webview).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
+      webviews: vec![Pattern::new(webview).unwrap()].into(),
       ..Default::default()
     }];
     let allowed_commands = [(command.to_string(), resolved_cmd.clone())]
@@ -923,7 +968,7 @@ mod tests {
     let webview = "main";
 
     let resolved_cmd = vec![ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
       context: ExecutionContext::Remote {
         url: url.parse().unwrap(),
       },
@@ -962,7 +1007,7 @@ mod tests {
     let webview = "main";
 
     let resolved_cmd = vec![ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
       context: ExecutionContext::Remote {
         url: url.parse().unwrap(),
       },
@@ -1000,7 +1045,7 @@ mod tests {
     let webview = "main";
 
     let resolved_cmd = vec![ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
       ..Default::default()
     }];
     let allowed_commands = [(command.to_string(), resolved_cmd)].into_iter().collect();
@@ -1032,7 +1077,7 @@ mod tests {
     let command = "my-command";
     let window = "main";
     let webview = "main";
-    let windows = vec![Pattern::new(window).unwrap()];
+    let windows: std::sync::Arc<[Pattern]> = vec![Pattern::new(window).unwrap()].into();
     let allowed_commands = [(
       command.to_string(),
       vec![ResolvedCommand {
@@ -1074,7 +1119,7 @@ mod tests {
     let command = "my-command";
     let window = "main";
     let webview = "main";
-    let windows = vec![Pattern::new(window).unwrap()];
+    let windows: std::sync::Arc<[Pattern]> = vec![Pattern::new(window).unwrap()].into();
 
     // the command is allowed on both the local app and the remote URL
     let allowed_commands = [(
@@ -1147,7 +1192,7 @@ mod tests {
     let command = "my-command";
     let window = "main";
     let webview = "main";
-    let windows = vec![Pattern::new(window).unwrap()];
+    let windows: std::sync::Arc<[Pattern]> = vec![Pattern::new(window).unwrap()].into();
 
     // the command is allowed on both the local app and the remote URL
     let allowed_commands = [(
@@ -1227,7 +1272,7 @@ mod tests {
     let window = "main";
     let webview = "main";
     let remote_url = "http://localhost:8080";
-    let windows = vec![Pattern::new(window).unwrap()];
+    let windows: std::sync::Arc<[Pattern]> = vec![Pattern::new(window).unwrap()].into();
 
     let remote_context = ExecutionContext::Remote {
       url: remote_url.parse().unwrap(),
@@ -1351,19 +1396,19 @@ mod tests {
     };
 
     let resolved_window_cmd = ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
       referenced_by: referenced_by.clone(),
       ..Default::default()
     };
     let resolved_webview_window_cmd = ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
-      webviews: vec![Pattern::new(webview).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
+      webviews: vec![Pattern::new(webview).unwrap()].into(),
       referenced_by: referenced_by.clone(),
       ..Default::default()
     };
     let resolved_webview_window_remote_cmd = ResolvedCommand {
-      windows: vec![Pattern::new(window).unwrap()],
-      webviews: vec![Pattern::new(webview).unwrap()],
+      windows: vec![Pattern::new(window).unwrap()].into(),
+      webviews: vec![Pattern::new(webview).unwrap()].into(),
       referenced_by,
       context: ExecutionContext::Remote {
         url: remote_url.parse().unwrap(),
@@ -1398,7 +1443,8 @@ mod tests {
         },
       )]
       .into_iter()
-      .collect(),
+      .collect::<std::collections::BTreeMap<_, _>>()
+      .into(),
       Resolved {
         allowed_commands,
         ..Default::default()
@@ -1558,7 +1604,7 @@ mod tests {
       tauri_utils::platform::Target::current(),
     )
     .unwrap();
-    let mut authority = RuntimeAuthority::new(acl, baked);
+    let mut authority = RuntimeAuthority::new(acl.into(), baked);
     assert_eq!(scope_ids(&authority, "plugin:opener|open_path"), [1].into());
 
     // a runtime capability for another plugin must not be merged into scope 1

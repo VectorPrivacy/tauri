@@ -34,6 +34,9 @@ pub(crate) mod protocol;
 pub use authority::{
   CommandScope, GlobalScope, Origin, RuntimeAuthority, ScopeObject, ScopeObjectMatch, ScopeValue,
 };
+#[cfg(any(feature = "dynamic-acl", debug_assertions))]
+#[doc(hidden)]
+pub use authority::LazyAcl;
 #[cfg(feature = "dynamic-acl")]
 pub use capability_builder::{CapabilityBuilder, RuntimeCapability};
 pub use channel::{Channel, JavaScriptChannelId};

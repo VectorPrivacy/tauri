@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::BTreeMap;
-use std::convert::identity;
 use std::path::{Path, PathBuf};
 use std::{ffi::OsStr, str::FromStr};
 
@@ -27,7 +26,7 @@ use tauri_utils::{
   config::{Config, FrontendDist, PatternKind},
   html2::{Document, inject_nonce_token, parse_doc, serialize_doc},
   platform::Target,
-  tokens::{map_lit, str_lit},
+  
 };
 
 /// Necessary data needed by [`context_codegen`] to generate code for a Tauri application context.
@@ -400,12 +399,26 @@ pub fn context_codegen(data: ContextData) -> EmbeddedAssetsResult<TokenStream> {
 
   let resolved = Resolved::resolve(&acl, capabilities, target).expect("failed to resolve ACL");
 
-  let acl_tokens = map_lit(
-    quote! { ::std::collections::BTreeMap },
-    &acl,
-    str_lit,
-    identity,
-  );
+  // The manifests ride along as one JSON string the runtime parses only when a capability is
+  // added at runtime: as a literal map they were thousands of allocations at every startup.
+  // Descriptions and scope schemas are documentation, never read at runtime.
+  let acl_json = {
+    let mut runtime_acl = acl;
+    for manifest in runtime_acl.values_mut() {
+      manifest.global_scope_schema = None;
+      for permission in manifest.permissions.values_mut() {
+        permission.description = None;
+      }
+      for set in manifest.permission_sets.values_mut() {
+        set.description = String::new();
+      }
+      if let Some(default) = manifest.default_permission.as_mut() {
+        default.description = String::new();
+      }
+    }
+    serde_json::to_string(&runtime_acl).expect("failed to serialize ACL manifests")
+  };
+  let acl_tokens = quote!(#root::ipc::LazyAcl::from_json(#acl_json));
 
   let runtime_authority = quote!(#root::runtime_authority!(#acl_tokens, #resolved));
 
