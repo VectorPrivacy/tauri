@@ -191,18 +191,61 @@ pub(crate) fn listen_js_script(
   )
 }
 
-pub(crate) fn emit_js_script(
+/// Payloads past this size reach the page as a string for `JSON.parse`.
+const JSON_PARSE_THRESHOLD: usize = 8 * 1024;
+
+/// Writes a JSON payload as a JS expression. A large one goes in as a string for `JSON.parse`:
+/// the engine scans a string literal and parses JSON natively, where an object literal of
+/// the same size is compiled to bytecode first (a boot state of megabytes did exactly that).
+fn write_payload(out: &mut String, payload: &str) {
+  if payload.len() < JSON_PARSE_THRESHOLD {
+    out.push_str(payload);
+    return;
+  }
+  out.reserve(payload.len() + 16);
+  out.push_str("JSON.parse('");
+  // Inside a single-quoted literal: `\` and `'` are escaped, and a raw line break (whitespace
+  // in pre-serialized JSON) becomes its escape, which JSON.parse reads as whitespace again.
+  // U+2028 and U+2029 are valid in string literals since ES2019.
+  let mut rest = payload;
+  while let Some(i) = rest.find(['\\', '\'', '\n', '\r']) {
+    out.push_str(&rest[..i]);
+    out.push_str(match rest.as_bytes()[i] {
+      b'\\' => "\\\\",
+      b'\'' => "\\'",
+      b'\n' => "\\n",
+      _ => "\\r",
+    });
+    rest = &rest[i + 1..];
+  }
+  out.push_str(rest);
+  out.push_str("')");
+}
+
+/// Appends the statement that hands one event to the page's listeners `ids`, in its own try
+/// block so a listener that throws stops only this event.
+pub(crate) fn write_emit_js(
+  out: &mut String,
   event_emit_function_name: &str,
   emit_args: &EmitArgs,
-  serialized_ids: &str,
-) -> crate::Result<String> {
-  Ok(format!(
-    "(function () {{ const fn = window['{}']; fn && fn({{event: '{}', payload: {}}}, {ids}) }})()",
+  ids: &[u32],
+) {
+  use std::fmt::Write;
+  let _ = write!(
+    out,
+    "try{{const f=window['{}'];f&&f({{event:'{}',payload:",
     event_emit_function_name,
     emit_args.event,
-    emit_args.payload,
-    ids = serialized_ids,
-  ))
+  );
+  write_payload(out, &emit_args.payload);
+  out.push_str("},[");
+  for (i, id) in ids.iter().enumerate() {
+    if i > 0 {
+      out.push(',');
+    }
+    let _ = write!(out, "{id}");
+  }
+  out.push_str("])}catch(e){console.error(e)}\n");
 }
 
 pub(crate) fn unlisten_js_script(
@@ -254,5 +297,44 @@ mod tests {
       "only alphanumeric, '-', '/', ':', '_' permitted for event names: \"some\\r illegal event name\"",
       s
     );
+  }
+}
+
+#[cfg(test)]
+mod payload_tests {
+  use super::write_payload;
+
+  #[test]
+  fn a_large_payload_round_trips_through_json_parse_escaping() {
+    let value = serde_json::json!({ "text": "it's a \\ path\nwith \u{2028} and \"quotes\"", "pad": "x".repeat(9000) });
+    let json = serde_json::to_string_pretty(&value).unwrap();
+    let mut out = String::new();
+    write_payload(&mut out, &json);
+    assert!(out.starts_with("JSON.parse('") && out.ends_with("')"));
+    // Undo the JS string escapes the way the engine reads the literal.
+    let inner = &out["JSON.parse('".len()..out.len() - 2];
+    let mut unescaped = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+      if c == '\\' {
+        match chars.next().unwrap() {
+          'n' => unescaped.push('\n'),
+          'r' => unescaped.push('\r'),
+          other => unescaped.push(other),
+        }
+      } else {
+        assert_ne!(c, '\'', "an unescaped quote would end the literal");
+        assert_ne!(c, '\n', "a raw line break would end the literal");
+        unescaped.push(c);
+      }
+    }
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&unescaped).unwrap(), value);
+  }
+
+  #[test]
+  fn a_small_payload_stays_a_literal() {
+    let mut out = String::new();
+    write_payload(&mut out, "{\"a\":1}");
+    assert_eq!(out, "{\"a\":1}");
   }
 }

@@ -1434,6 +1434,8 @@ pub struct Webview<R: Runtime> {
   pub(crate) app_handle: AppHandle<R>,
   pub(crate) resources_table: Arc<Mutex<ResourceTable>>,
   use_https_scheme: bool,
+  /// Events emitted since the last flush, evaluated together on the main thread.
+  event_batch: Arc<Mutex<Option<String>>>,
 }
 
 impl<R: Runtime> std::fmt::Debug for Webview<R> {
@@ -1455,6 +1457,7 @@ impl<R: Runtime> Clone for Webview<R> {
       app_handle: self.app_handle.clone(),
       resources_table: self.resources_table.clone(),
       use_https_scheme: self.use_https_scheme,
+      event_batch: self.event_batch.clone(),
     }
   }
 }
@@ -1500,6 +1503,7 @@ impl<R: Runtime> Webview<R> {
       webview,
       resources_table: Default::default(),
       use_https_scheme,
+      event_batch: Default::default(),
     }
   }
 
@@ -2171,11 +2175,27 @@ tauri::Builder::default()
 
   /// Evaluates JavaScript on this window.
   pub fn eval(&self, js: impl Into<String>) -> crate::Result<()> {
+    let js = js.into();
+    // Events queued before this script run before it.
+    self.flush_events()?;
     self
       .webview
       .dispatcher
-      .eval_script(js.into())
+      .eval_script(js)
       .map_err(Into::into)
+  }
+
+  /// Evaluate the events batched so far, if any.
+  fn flush_events(&self) -> crate::Result<()> {
+    let batch = self.event_batch.lock().unwrap().take();
+    match batch {
+      Some(js) => self
+        .webview
+        .dispatcher
+        .eval_script(js)
+        .map_err(Into::into),
+      None => Ok(()),
+    }
   }
 
   /// Evaluate JavaScript with callback function on this webview.
@@ -2227,12 +2247,29 @@ tauri::Builder::default()
     Ok(())
   }
 
+  /// Events reach the page in batches: everything emitted before the main thread next runs
+  /// is one evaluation, where a burst (a sync, a transfer) was one evaluation and one
+  /// main-thread message per event. Each event stays in its own try block, so a listener that
+  /// throws stops only its own event, as before.
   pub(crate) fn emit_js(&self, emit_args: &EmitArgs, ids: &[u32]) -> crate::Result<()> {
-    self.eval(crate::event::emit_js_script(
-      self.manager().listeners().function_name(),
-      emit_args,
-      &serde_json::to_string(ids)?,
-    )?)?;
+    let first = {
+      let mut batch = self.event_batch.lock().unwrap();
+      let pending = batch.get_or_insert_with(String::new);
+      let first = pending.is_empty();
+      crate::event::write_emit_js(
+        pending,
+        self.manager().listeners().function_name(),
+        emit_args,
+        ids,
+      );
+      first
+    };
+    if first {
+      let webview = self.clone();
+      self.run_on_main_thread(move || {
+        let _ = webview.flush_events();
+      })?;
+    }
     Ok(())
   }
 
@@ -2846,3 +2883,4 @@ mod tests {
     assert!(result.is_ok(), "set_simple_fullscreen should succeed");
   }
 }
+
